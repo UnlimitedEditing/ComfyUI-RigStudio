@@ -21,9 +21,29 @@ WH = re.compile(r"^(?:\W*(?:well|so|and|but|okay|ok|now|oh)\W+)*(what|why|how|wh
 
 
 def _segments(lyrics_json):
+    """Whisper segments split into sentences using their word timings, so a '?' lands at a real
+    sentence end with exact timing (confirmed live: whole segments hid mid-segment questions)."""
     data = json.loads(lyrics_json or "{}")
-    segs = [s for s in data.get("timeline", []) if s.get("type", "lyric") == "lyric" and s.get("text", "").strip()]
-    return [{"t0": float(s["start"]), "t1": float(s["end"]), "text": s["text"].strip()} for s in segs]
+    out = []
+    for s in data.get("timeline", []):
+        if s.get("type", "lyric") != "lyric" or not s.get("text", "").strip():
+            continue
+        words = [w for w in s.get("words") or [] if str(w.get("text", "")).strip()]
+        if not words:
+            out.append({"t0": float(s["start"]), "t1": float(s["end"]), "text": s["text"].strip()})
+            continue
+        cur = []
+        for w in words:
+            cur.append(w)
+            if re.search(r"[.?!]['\"]?$", w["text"].strip()):
+                out.append(cur)
+                cur = []
+        if cur:
+            out.append(cur)
+        out[:] = [x if isinstance(x, dict) else
+                  {"t0": float(x[0]["start"]), "t1": float(x[-1]["end"]),
+                   "text": " ".join(w["text"].strip() for w in x)} for x in out]
+    return out
 
 
 class RigStudioIntentPrompt:

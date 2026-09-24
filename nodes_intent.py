@@ -74,6 +74,31 @@ class RigStudioIntentPack:
         return (encode_string_as_image(json.dumps(payload, ensure_ascii=False)), intent)
 
 
-NODE_CLASS_MAPPINGS = {"RigStudioIntentPrompt": RigStudioIntentPrompt, "RigStudioIntentPack": RigStudioIntentPack}
+class RigStudioModelPath:
+    """Absolute path of a concept-staged model folder under ComfyUI's models dir, for nodes that take a
+    Hugging Face id OR a local path (e.g. HFTextGenerate.model_id). Staging the LLM by concept_mapping
+    moves its ~15 GB download before the job clock starts. Falls back to the hub id if not staged."""
+    CATEGORY = "RigStudio"
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("path",)
+    FUNCTION = "run"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"subpath": ("STRING", {"default": "llm/Qwen2.5-7B-Instruct"}),
+                             "fallback_id": ("STRING", {"default": "Qwen/Qwen2.5-7B-Instruct"})}}
+
+    def run(self, subpath, fallback_id):
+        import folder_paths
+        p = os.path.join(folder_paths.models_dir, subpath)
+        ok = os.path.isfile(os.path.join(p, "config.json"))
+        print(f"[RigStudioModelPath] {p if ok else fallback_id} ({'staged' if ok else 'NOT staged, using hub id'})",
+              flush=True)
+        return (p if ok else fallback_id,)
+
+
+NODE_CLASS_MAPPINGS = {"RigStudioIntentPrompt": RigStudioIntentPrompt, "RigStudioIntentPack": RigStudioIntentPack,
+                       "RigStudioModelPath": RigStudioModelPath}
 NODE_DISPLAY_NAME_MAPPINGS = {"RigStudioIntentPrompt": "Rig Studio: intent prompt from transcript",
-                              "RigStudioIntentPack": "Rig Studio: pack LLM reply into intent"}
+                              "RigStudioIntentPack": "Rig Studio: pack LLM reply into intent",
+                              "RigStudioModelPath": "Rig Studio: staged model path"}

@@ -12,6 +12,7 @@ Everything is cached under WORK_DIR, so a warm container reuses it.
 """
 import asyncio
 import glob
+import re
 import os
 import signal
 import sys
@@ -150,3 +151,57 @@ def model_workdir(src, engine_path, name):
         os.remove(trt)
     os.symlink(engine_path, trt)
     return os.path.join(wd, "model.json")
+
+
+ANALYSIS_PKGS = ["librosa>=0.10.2,<2", "soundfile"]
+
+
+async def ensure_analysis(log):
+    """librosa & co. for track_job.py, installed WITH deps into their own private folder — the
+    analysis runs as a subprocess on that PYTHONPATH, so ComfyUI's numpy/scipy are never touched."""
+    priv = os.path.join(WORK_DIR, "analysis-deps")
+    marker = os.path.join(priv, ".ok-" + "-".join(re.sub(r"[^\w.]", "", p) for p in ANALYSIS_PKGS))
+    t0 = time.time()
+    if not os.path.isfile(marker):
+        rc, out, err = await run_subprocess(
+            [sys.executable, "-m", "pip", "install", "--quiet", "--target", priv, *ANALYSIS_PKGS],
+            stream_prefix="pip-analysis")
+        if rc != 0:
+            raise RuntimeError(f"analysis deps install failed (rc={rc}):\n{err[-3000:]}")
+        open(marker, "w").close()
+    log(f"analysis deps ready in {time.time() - t0:.1f}s")
+    return {"PYTHONPATH": priv}, round(time.time() - t0, 2)
+
+
+async def fetch_audio_16k(src, log):
+    """URL or local path -> 16 kHz mono wav via the system ffmpeg (torchaudio/torchcodec are
+    unreliable on Graydient). Returns (wav_path, duration_s)."""
+    d = os.path.join(WORK_DIR, "audio")
+    os.makedirs(d, exist_ok=True)
+    raw = src
+    if re.match(r"^https?://", src):
+        raw = os.path.join(d, "input" + (os.path.splitext(src.split("?")[0])[1] or ".bin"))
+        if os.path.exists(raw):
+            os.remove(raw)
+        await asyncio.to_thread(urllib.request.urlretrieve, src, raw)
+    wav = os.path.join(d, "input16k.wav")
+    rc, _, err = await run_subprocess(["ffmpeg", "-v", "error", "-y", "-i", raw, "-ac", "1", "-ar", "16000",
+                                       "-c:a", "pcm_s16le", wav])
+    if rc != 0:
+        raise RuntimeError(f"ffmpeg could not decode {src}: {err[-800:]}")
+    duration = os.path.getsize(wav) / 32000.0     # 16 kHz * 2 bytes, header negligible
+    log(f"audio ready: {duration:.1f}s")
+    return wav, duration
+
+
+async def fetch_engine(url, log):
+    """A prebuilt (Ampere+ hardware-compatible) engine by URL (or local path), cached."""
+    if os.path.isfile(url):
+        return url
+    d = os.path.join(WORK_DIR, "engines")
+    os.makedirs(d, exist_ok=True)
+    dest = os.path.join(d, "downloaded-" + re.sub(r"[^\w.-]", "_", url.split("/")[-1].split("?")[0]))
+    t0 = time.time()
+    await _download(url, dest)
+    log(f"engine downloaded in {time.time() - t0:.1f}s ({os.path.getsize(dest) / 1e6:.1f} MB)")
+    return dest

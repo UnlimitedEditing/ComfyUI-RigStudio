@@ -6,6 +6,9 @@ ComfyUI nodes for Rig Studio: build-time facial animation for long-form talking-
 
 | Node | What it does |
 |---|---|
+| `RigStudioBuildTrack` | **Job B.** Speech audio URL + intent string → Audio2Face-3D (driven by the intent's emotions) + Rig Studio gesture layer → hybrid expression track (JSON as a data image). |
+| `RigStudioIntentPrompt` | **Job A.** Whisper transcript (`TranscribeAudioFromURL` lyrics_json) → emotion-direction prompt for an LLM. |
+| `RigStudioIntentPack` | **Job A.** Transcript + LLM reply → compact intent string `S t0 t1 [q\|wq] emotion weight …` (+ JSON data image). |
 | `RigStudioA2FProbe` | Provisions an isolated NVIDIA Audio2Face-3D runtime, builds a TensorRT engine for Audio2Face-3D v2.3 Mark (optionally Ampere+ hardware-compatible), runs it on a 4 s sample and returns a JSON report as a data image. |
 
 ## Runtime (no compilation on the host)

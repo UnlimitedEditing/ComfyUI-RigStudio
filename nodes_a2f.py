@@ -129,7 +129,7 @@ class RigStudioBuildTrack:
             "intent": ("STRING", {"multiline": True, "default": "",
                                   "tooltip": "S <t0> <t1> [q|wq] <emotion> <weight> ... | none — from Job A; empty = neutral"}),
             "engine_url": ("STRING", {"default": "",
-                                      "tooltip": "prebuilt Ampere+ TensorRT engine URL; empty = build one (~1-2 min)"}),
+                                      "tooltip": "empty = published Ampere+ engine (a2f-engine-v1); 'build' = build in-job (~60 s); or an engine URL/path"}),
             "seed": ("INT", {"default": 7, "min": 0, "max": 2 ** 31 - 1}),
         }}
 
@@ -154,9 +154,15 @@ class RigStudioBuildTrack:
 
         # the emotion curve is written next to the wav, where rigstudio-a2f looks for it
         await analysis("emotion", intent_p, f"{duration:.3f}", os.path.splitext(wav)[0] + ".emotion.txt")
-        if engine_url.strip():
-            engine = await R.fetch_engine(engine_url.strip(), log)
-        else:
+        # "" -> the published Ampere+ engine (fallback: build), "build" -> build in-job, else URL/path
+        choice = engine_url.strip()
+        engine = None
+        if choice != "build":
+            try:
+                engine = await R.fetch_engine(choice or R.DEFAULT_ENGINE_URL, log)
+            except Exception as e:
+                log(f"engine download failed ({type(e).__name__}: {e}); building instead")
+        if engine is None:
             engine = os.path.join(R.WORK_DIR, "engines", "mark-v2.3-trt10.13.3-ampere_plus.trt")
             os.makedirs(os.path.dirname(engine), exist_ok=True)
             if not os.path.isfile(engine):

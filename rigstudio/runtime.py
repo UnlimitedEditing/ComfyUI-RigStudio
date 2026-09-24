@@ -24,6 +24,11 @@ import urllib.request
 WORK_DIR = os.path.join(tempfile.gettempdir(), "rigstudio")
 RELEASE = "https://github.com/UnlimitedEditing/ComfyUI-RigStudio/releases/download/a2f-runtime-v1"
 BUNDLE = "rigstudio-a2f-linux-x86_64-cuda12-trt10.13.tar.gz"
+# Ampere+ hardware-compatible engine for Audio2Face-3D v2.3 Mark (NVIDIA Open Model License, see the
+# release's NOTICE). Default for RigStudioBuildTrack: Graydient's option parser splits slot values on
+# "/", so URLs cannot be passed through slots — the node falls back to this instead.
+DEFAULT_ENGINE_URL = ("https://github.com/UnlimitedEditing/ComfyUI-RigStudio/releases/download/a2f-engine-v1/"
+                      "audio2face-3d-v2.3-mark-trt10.13.3-ampere_plus.trt")
 PIP_PKGS = [
     "tensorrt-cu12-libs==10.13.3.9",
     "tensorrt-cu12-bindings==10.13.3.9",

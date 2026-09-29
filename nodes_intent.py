@@ -94,6 +94,41 @@ class RigStudioIntentPack:
         return (encode_string_as_image(json.dumps(payload, ensure_ascii=False)), intent)
 
 
+class RigStudioTranscribe:
+    """Punctuated, sentence-level transcript (faster-whisper medium + style prompt; see
+    rigstudio/transcribe_core.py for the measurements behind the settings). Drop-in replacement for
+    TranscribeAudioFromURL in the director job: same lyrics_json shape, one timeline entry per sentence."""
+    CATEGORY = "RigStudio"
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("lyrics_json",)
+    FUNCTION = "run"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "audio_url": ("STRING", {"default": "", "tooltip": "speech audio URL (or local path)"}),
+            "model_size": (["medium", "large-v3", "small"], {"default": "medium"}),
+            "language": ("STRING", {"default": "", "tooltip": "e.g. en; empty = auto-detect"}),
+        }}
+
+    async def run(self, audio_url, model_size, language):
+        import asyncio
+        import time
+        import folder_paths
+        from .rigstudio import runtime as R
+        from .rigstudio import transcribe_core as TC
+        t0 = time.time()
+        wav, duration = await R.fetch_audio_16k(audio_url.strip(), print)
+        staged = os.path.join(folder_paths.models_dir, "whisper", model_size)
+        src = staged if os.path.isfile(os.path.join(staged, "model.bin")) else model_size
+        model = await asyncio.to_thread(TC.load_model, src)
+        data = await asyncio.to_thread(TC.transcribe, model, wav, language.strip() or None)
+        data["audio_url"] = audio_url.strip()
+        print(f"[RigStudioTranscribe] {len(data['timeline'])} sentences from {duration:.1f}s audio "
+              f"({model_size}, {'staged' if src == staged else 'hub download'}) in {time.time() - t0:.1f}s", flush=True)
+        return (json.dumps(data, ensure_ascii=False),)
+
+
 class RigStudioModelPath:
     """Absolute path of a concept-staged model folder under ComfyUI's models dir, for nodes that take a
     Hugging Face id OR a local path (e.g. HFTextGenerate.model_id). Staging the LLM by concept_mapping
@@ -118,7 +153,8 @@ class RigStudioModelPath:
 
 
 NODE_CLASS_MAPPINGS = {"RigStudioIntentPrompt": RigStudioIntentPrompt, "RigStudioIntentPack": RigStudioIntentPack,
-                       "RigStudioModelPath": RigStudioModelPath}
+                       "RigStudioModelPath": RigStudioModelPath, "RigStudioTranscribe": RigStudioTranscribe}
 NODE_DISPLAY_NAME_MAPPINGS = {"RigStudioIntentPrompt": "Rig Studio: intent prompt from transcript",
                               "RigStudioIntentPack": "Rig Studio: pack LLM reply into intent",
-                              "RigStudioModelPath": "Rig Studio: staged model path"}
+                              "RigStudioModelPath": "Rig Studio: staged model path",
+                              "RigStudioTranscribe": "Rig Studio: transcribe (punctuated sentences)"}

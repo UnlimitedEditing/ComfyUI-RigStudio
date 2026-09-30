@@ -15,6 +15,8 @@ CLEAN = ("Remove every piece of furniture and every object from this room, and t
          "where an object was with the wall or the floor that would be behind it, continuing its pattern.")
 CUT = ("Keep only {g}, exactly as drawn, in exactly the same position and size. Remove everything else, including the "
        "walls, the floor, the ceiling, windows, other furniture and all shadows.")
+ROOM_NORMALS = ("Paint the scene with object-space normal map colours, bright colours for easy plane orientation "
+                "detection including the floor, walls and ceiling planes. The scene is neutral and completely unlit.")
 NORMALS = ("Paint {g} with object-space normal map colours, bright colours for easy plane orientation detection. "
            "Keep the exact same shapes, positions and sizes. The objects are neutral and completely unlit, on a plain "
            "black background.")
@@ -22,8 +24,9 @@ NORMALS = ("Paint {g} with object-space normal map colours, bright colours for e
 
 class RigStudioSetPrompts:
     CATEGORY = "RigStudio"
-    RETURN_TYPES = ("STRING",) * (1 + 2 * MAX_GROUPS)
-    RETURN_NAMES = ("clean",) + tuple(f"{k}_{i}" for i in range(1, MAX_GROUPS + 1) for k in ("cutout", "normals"))
+    # room_normals is APPENDED (v1 of rig-set-layers is wired to the first 7 outputs)
+    RETURN_TYPES = ("STRING",) * (2 + 2 * MAX_GROUPS)
+    RETURN_NAMES = ("clean",) + tuple(f"{k}_{i}" for i in range(1, MAX_GROUPS + 1) for k in ("cutout", "normals")) +         ("room_normals",)
     FUNCTION = "run"
 
     @classmethod
@@ -37,6 +40,7 @@ class RigStudioSetPrompts:
         out = [CLEAN.format(groups="; ".join(dict.fromkeys(gs)))]
         for g in gs:
             out += [RGBA.format(CUT.format(g=g)), NORMALS.format(g=g)]
+        out.append(ROOM_NORMALS)
         print(f"[RigStudioSetPrompts] groups: {gs}", flush=True)
         return tuple(out)
 

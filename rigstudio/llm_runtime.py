@@ -119,11 +119,16 @@ def prepare_models(model, log):
     for d in [m["config"], *m["layers"]]:
         fname = d["digest"].replace(":", "-")
         src, dst = os.path.join(staged, fname), os.path.join(blobs, fname)
-        if os.path.isfile(dst):
-            continue
         if os.path.isfile(src) and os.path.getsize(src) == d["size"]:
+            # re-point every run: on a warm machine an old link can dangle into a deleted project dir
+            if os.path.lexists(dst):
+                os.remove(dst)
             os.symlink(src, dst)
+        elif os.path.isfile(dst) and not os.path.islink(dst):
+            continue                                   # pulled in-job on an earlier run
         else:
+            if os.path.lexists(dst):
+                os.remove(dst)
             missing += 1
     if not missing:
         mdir = os.path.join(home, "manifests", "registry.ollama.ai", "library", name)

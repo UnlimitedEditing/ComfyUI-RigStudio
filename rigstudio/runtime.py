@@ -148,9 +148,12 @@ def model_workdir(src, engine_path, name):
     os.makedirs(wd, exist_ok=True)
     for f in os.listdir(src):
         if f.endswith((".json", ".npz")):
+            # Always re-point: on a warm machine /tmp/rigstudio outlives the job, and its links can dangle
+            # into a previous workflow's (deleted) project models dir — os.path.exists() is False for those.
             dst = os.path.join(wd, f)
-            if not os.path.exists(dst):
-                os.symlink(os.path.join(src, f), dst)
+            if os.path.lexists(dst):
+                os.remove(dst)
+            os.symlink(os.path.join(src, f), dst)
     trt = os.path.join(wd, "network.trt")
     if os.path.lexists(trt):
         os.remove(trt)

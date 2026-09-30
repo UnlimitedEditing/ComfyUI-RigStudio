@@ -9,10 +9,15 @@ unlit -- verified on the kitchen table + chairs.
 """
 MAX_GROUPS = 3
 RGBA = "This is an RGBA format image with transparency. {} The image has an alpha channel and a transparent background."
-CLEAN = ("Remove every piece of furniture and every object from this room, and their shadows: {groups}. Keep the "
-         "windows, doors and pictures on the walls. Keep everything else exactly as it is: the same walls, floor, "
-         "ceiling, corners, skirting boards, perspective, colours, patterns and black outline style. Fill every place "
-         "where an object was with the wall or the floor that would be behind it, continuing its pattern.")
+# Clean plate: name EVERY object on its own and describe the target planes deliberately. Two lumped groups let the
+# fridge survive (both rig-set-layers runs, renders G0K0Ve + y92998); Jacob's itemised, plane-focused prompt cleared the
+# same kitchen perfectly (render 6Ko585). Indoor wording -- outdoor scenes will need their own (sky, ground, horizon).
+CLEAN = ("Remove every piece of furniture and every object from this room, one by one: {items}, and all of their "
+         "shadows. Leave only the empty room's bare planes: the walls, the floor and the ceiling, plus the windows, "
+         "doors and pictures on the walls. Keep those exactly as they are: the same wall colours, the same floor with "
+         "its pattern and lines continuing across the whole floor, the same ceiling, corners, skirting boards, "
+         "perspective and black outline style. Fill every place where an object stood with the wall or the floor that "
+         "would be behind it.")
 CUT = ("Keep only {g}, exactly as drawn, in exactly the same position and size. Remove everything else, including the "
        "walls, the floor, the ceiling, windows, other furniture and all shadows.")
 ROOM_NORMALS = ("Paint the scene with object-space normal map colours, bright colours for easy plane orientation "
@@ -20,6 +25,20 @@ ROOM_NORMALS = ("Paint the scene with object-space normal map colours, bright co
 NORMALS = ("Paint {g} with object-space normal map colours, bright colours for easy plane orientation detection. "
            "Keep the exact same shapes, positions and sizes. The objects are neutral and completely unlit, on a plain "
            "black background.")
+
+
+def items_of(groups):
+    """'the fridge, cupboards, range hood, stove and counters' -> ['the fridge', 'the cupboards', ...]"""
+    import re
+    out = []
+    for g in groups:
+        for part in re.split(r",|\band\b|;", g):
+            part = part.strip().strip(".")
+            if not part:
+                continue
+            part = re.sub(r"^(the|a|an|all|both)\s+", "", part, flags=re.I)
+            out.append("the " + part)
+    return list(dict.fromkeys(out))
 
 
 class RigStudioSetPrompts:
@@ -37,7 +56,7 @@ class RigStudioSetPrompts:
     def run(self, groups):
         gs = [g.strip().strip(".") for g in groups.replace("\n", ";").split(";") if g.strip()] or ["the furniture"]
         gs = (gs + [gs[-1]] * MAX_GROUPS)[:MAX_GROUPS]
-        out = [CLEAN.format(groups="; ".join(dict.fromkeys(gs)))]
+        out = [CLEAN.format(items=", ".join(items_of(dict.fromkeys(gs))))]
         for g in gs:
             out += [RGBA.format(CUT.format(g=g)), NORMALS.format(g=g)]
         out.append(ROOM_NORMALS)

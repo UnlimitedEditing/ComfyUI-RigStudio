@@ -226,7 +226,8 @@ class EyeLayersHaveNoBrowsNewCharacter(unittest.TestCase):
         thick = [i for i in range(1, n + 1) if ndimage.distance_transform_edt(lab == i).max() >= 14]
         # only the pupils (round, 2) are that thick: a brow stroke would make it 3 or 4
         self.assertLessEqual(len(thick), 2)
-        self.assertGreaterEqual(ink.sum(), 2 * 1500)
+        # the lid lines of both eyes are still there (the pupils are not: they are drawn by the player)
+        self.assertGreaterEqual(ink.sum(), 2 * 1000)
 
 
 if __name__ == "__main__":

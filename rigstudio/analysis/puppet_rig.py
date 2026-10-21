@@ -86,7 +86,7 @@ def brow_strokes(frame, geo):
     redraw the brows low, right where another character's upper-lid arc sits (a freckled boy, 2026-10-21: a thin arc
     above each open eye is part of the eye, and a lowered brow in `narrow` covers the same rows). Lid arcs and hair lines
     never change when only the brows are edited; brows always do."""
-    top, bot, x_lo, x_hi, moving = geo
+    top, bot, x_lo, x_hi, moving = geo[:5]
     mid = top + 0.5 * (bot - top)
     y0 = max(0, top - (bot - top))                # brows can sit well above the whites
     y1 = min(frame.shape[0], bot + int(0.1 * (bot - top)))
@@ -159,6 +159,111 @@ def skin_color(base, region):
     return np.median(px[key == top], axis=0).astype(base.dtype)
 
 
+def eye_region(base, frames, geo, band):
+    """The eye layer's region, built from the eye's own STRUCTURE, not from "everything that changed".
+
+    The union of changed pixels dragged in what the model re-rendered softly from one frame to the next (forehead and
+    cheek shading, freckles, the nose bridge) and cut the eye whites where a brow zone overlapped them. Instead, per
+    eye: the whites (filled, so pupils are inside) of the base and every frame, plus the ink that belongs to the eye
+    (touching the whites, or a long lid line / closed-eye curve / lash row near them; short isolated dots are freckles),
+    then the convex hull of that with a small margin. Brow strokes never count.
+    Returns (region mask, sclera union mask)."""
+    top, bot, x_lo, x_hi = geo[:4]
+    eh = bot - top
+    y_lo, y_hi = band
+    H, W = base.shape[:2]
+    yy = np.arange(H)[:, None]
+    in_band = (yy >= y_lo) & (yy < y_hi)
+
+    def whites(img):
+        white = (img.min(-1) > WHITE) & in_band
+        lab, n = ndimage.label(white)
+        border = set(np.unique(np.concatenate([lab[0], lab[-1], lab[:, 0], lab[:, -1]])))
+        keep = [i for i in range(1, n + 1) if i not in border and (lab == i).sum() > 0.0005 * white.size]
+        return np.isin(lab, keep)
+
+    w0 = keep_largest(whites(base), 2)
+    near0 = ndimage.binary_dilation(w0, iterations=max(3, int(0.08 * eh)))
+    sclera = np.zeros_like(w0)
+    ink_all = np.zeros_like(w0)
+    for f in [base] + list(frames):
+        wf = whites(f)
+        lab, n = ndimage.label(wf)
+        if n:
+            hit = np.unique(lab[near0 & wf])
+            sclera |= np.isin(lab, hit[hit > 0])
+        brow = ndimage.binary_dilation(brow_strokes(f, geo), iterations=BROW_ZONE_GROW)
+        ink_all |= ink_mask(f) & ~brow & in_band
+    sclera = ndimage.binary_fill_holes(sclera | w0)
+    xs = np.nonzero(sclera)[1]
+    width = xs.max() - xs.min()
+    grown = ndimage.binary_dilation(sclera, iterations=2)
+    reach = ndimage.binary_dilation(sclera, iterations=max(4, int(0.45 * eh)))   # long ink must at least be near
+    lab, n = ndimage.label(ink_all, structure=np.ones((3, 3)))
+    eye_ink = np.zeros_like(sclera)
+    for i, (ys_, xs_) in enumerate(ndimage.find_objects(lab), start=1):
+        blob = lab == i
+        if blob.sum() < BROW_BLOB:
+            continue
+        long_ = (xs_.stop - xs_.start) >= 0.2 * width / 2
+        if (blob & grown).any() or (long_ and (blob & reach).any()):
+            eye_ink |= blob
+    struct = sclera | eye_ink
+    cx = np.nonzero(w0)[1].mean()
+    region = np.zeros_like(struct)
+    margin = max(3, int(0.04 * eh))
+    from PIL import ImageDraw
+    from scipy.spatial import ConvexHull
+    xcol = np.arange(W)[None, :]
+    for side in (xcol < cx, xcol >= cx):
+        pts = np.argwhere(struct & side)
+        if len(pts) < 10:
+            continue
+        hull = pts[ConvexHull(pts).vertices]
+        img = Image.new("L", (W, H), 0)
+        ImageDraw.Draw(img).polygon([(int(x), int(y)) for y, x in hull], fill=255)
+        region |= np.asarray(img) > 0
+    return ndimage.binary_dilation(region, iterations=margin) & in_band, sclera
+
+
+def despeckle_skin(img, region):
+    """Within a layer region, replace everything that is neither eye white nor ink (and not next to either) by a median
+    of itself: broad lid shading survives, the faint hairline creases the model draws differently in every frame
+    (they showed as stray arcs that stayed behind when the brows moved) do not."""
+    ys, xs = np.nonzero(region)
+    y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+    crop = img[y0:y1, x0:x1]
+    keep = (crop.min(-1) > WHITE) | (crop.astype(np.int32).sum(-1) < BROW_INK)
+    keep = ndimage.binary_dilation(keep, iterations=3)
+    smooth = np.stack([ndimage.median_filter(crop[..., c], size=9) for c in range(3)], -1)
+    out = img.copy()
+    out[y0:y1, x0:x1] = np.where(keep[..., None], crop, smooth)
+    return out
+
+
+def lidded_pupils(img, sclera, base_pupils, eh):
+    """For an eye frame whose lid cuts the whites (so pupils_of fails): -> (pupil mask, clip) or None.
+
+    The pupils of such a frame are drawn by the model at their own size and place, which flickered against the open
+    eye (whose pupils the player draws from the base sprite). Find them (ink blobs too thick to be a lid line or lash,
+    inside the whites), paint them white, and return the opening (whites + pupils, i.e. below the lid line) as the clip
+    so the player can draw the same base pupils here, hidden by the lid."""
+    ink = ink_mask(img)
+    r = max(3, int(0.12 * eh))
+    yy, xx = np.mgrid[-r:r + 1, -r:r + 1]
+    core = ndimage.binary_opening(ink & ndimage.binary_dilation(sclera, iterations=r), structure=(xx * xx + yy * yy) <= r * r)
+    lab, n = ndimage.label(core)
+    want = 0.25 * np.mean([hole.sum() for _, hole, _ in base_pupils])
+    keep = [i for i in range(1, n + 1) if (lab == i).sum() >= want]
+    if len(keep) != 2:
+        return None
+    pupil = ndimage.binary_dilation(np.isin(lab, keep), iterations=3, mask=ink)
+    near = ndimage.binary_dilation(sclera, iterations=4)   # not the white background around the head
+    white = (img.min(-1) > WHITE) & near
+    opening = ndimage.binary_fill_holes(ndimage.binary_closing(white | pupil, iterations=2)) & near
+    return pupil, opening
+
+
 def part_unions(base, sheets):
     W = base.shape[1]
     grow = max(1, int(GROW * W))
@@ -224,9 +329,12 @@ def part_unions(base, sheets):
     regions = {p: anyone & (owner == i) for i, p in enumerate(names)}
     # the base's brow footprint is the brows' by rule, whatever the distances said
     regions["brows"] |= zone
-    regions["eyes"] &= ~zone
     regions["mouth"] &= ~zone
-    return regions, raw, geo
+    regions["eyes"], sclera = eye_region(base, sheets["eyes"][1:], geo, (eye_top - int(0.25 * eh), mouth_line))
+    regions["eyes"] &= ~(ndimage.binary_dilation(blush, iterations=8) & ~ndimage.binary_dilation(sclera, iterations=2))   # cheek blush belongs to no part
+    regions["eyes"] &= ~(zone & ~ndimage.binary_dilation(sclera, iterations=2))   # the brows' footprint stays theirs
+    regions["mouth"] &= ~regions["eyes"]
+    return regions, raw, geo + (sclera,)
 
 
 def soft(mask):
@@ -321,10 +429,24 @@ def build(d):
     pupil_info, clips = [], {}
     processed = []
     skin = skin_color(base, regions["eyes"])
+    bp = base.astype(np.int32)
+    plain_skin = (bp.sum(-1) >= BROW_INK) & (bp.min(-1) <= WHITE) & ~((bp[..., 0] > 190) & (bp[..., 0] - bp[..., 1] > 85))
+    near_skin = np.abs(bp - skin.astype(np.int32)).sum(-1) <= 45
     for key, img in eye_frames:
         img = img.copy()
+        if key != "open":
+            # the model re-renders skin shading a little differently in every frame: only strong changes are the eye's
+            # (but only where the base is plain skin: its thin pale crease lines are not shading, and the frame
+            # rightly leaves them out)
+            soft_px = (np.abs(img.astype(np.int16) - base.astype(np.int16)).sum(-1) <= THRESH) & near_skin
+            img[soft_px] = base[soft_px]
         erase = eye_frame_brows(img, geo)   # the brows run as their own track: no brow stroke in an eye layer
-        img[erase] = skin
+        img[erase] = np.where(plain_skin[erase][:, None], base[erase], skin)
+        # a brow that overlapped the eye whites must not leave a bite out of them: the pupils move inside the white
+        bite = erase & geo[5] & (img.min(-1) <= WHITE)
+        if (img.min(-1) > WHITE)[geo[5]].any() and key in ("open", "lid25", "wide"):
+            img[bite] = np.median(img[geo[5] & (img.min(-1) > WHITE)], axis=0)
+        img = despeckle_skin(img, regions["eyes"])
         found = pupils_of(img, regions["eyes"]) if base_pupils else None
         if found:
             clip = np.zeros(img.shape[:2], bool)
@@ -334,6 +456,12 @@ def build(d):
                 img[grow_hole] = white_col
                 clip |= filled
             clips[key] = clip
+        elif base_pupils and key != "open":
+            lp = lidded_pupils(img, geo[5], base_pupils, geo[1] - geo[0])
+            if lp:
+                pupil, opening = lp
+                img[pupil] = np.median(img[(img.min(-1) > WHITE) & geo[5]], axis=0)
+                clips[key] = opening
         processed.append((key, img))
     e, alpha, box = add_part("eyes", regions["eyes"], processed)
     e["rest"] = "open"

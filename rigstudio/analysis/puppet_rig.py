@@ -60,6 +60,85 @@ def keep_largest(mask, n):
     return np.isin(lab, 1 + np.argsort(sizes)[::-1][:n])
 
 
+BROW_INK = 200       # summed RGB below this = outline ink
+BROW_BLOB = 100      # px: smaller ink blobs are specks, not strokes
+BROW_ZONE_GROW = 4   # px of margin around a brow stroke (covers its antialiased edge)
+
+
+def brow_strokes(frame, geo, touch=None):
+    """Mask of the eyebrow strokes in a full frame.
+
+    A brow stroke is an ink blob that is SEPARATE from the eye (its own connected blob), sits inside the eye columns,
+    and whose bottom edge is above the eyes' midline. Every real eye element (outline, lid line, lashes, the closed-eye
+    curve) reaches below the midline, so the test does not need to know where the brows "should" be: the eye edits
+    (lid25..narrow, shut) redraw the brows lower, at rest or tilted, and "above the top of the eye whites" would miss
+    those (bluebob2: the tilted brows of lid75/narrow sit lower than the whites' top).
+
+    `touch`, when given, keeps only the strokes that overlap that mask (used to leave hair lines alone: they sit in the
+    same columns but never move with the brows)."""
+    top, bot, x_lo, x_hi = geo
+    mid = top + 0.5 * (bot - top)
+    y0 = max(0, top - (bot - top))                # brows can sit well above the whites
+    y1 = min(frame.shape[0], bot + int(0.1 * (bot - top)))
+    ink = frame[y0:y1].astype(np.int32).sum(-1) < BROW_INK
+    comp, n = ndimage.label(ink, structure=np.ones((3, 3)))
+    out = np.zeros(frame.shape[:2], bool)
+    if n:
+        areas = ndimage.sum(ink, comp, range(1, n + 1))
+        for i, (ys, xs) in enumerate(ndimage.find_objects(comp), start=1):
+            if areas[i - 1] < BROW_BLOB:
+                continue
+            bottom, cx = y0 + ys.stop - 1, (xs.start + xs.stop - 1) / 2
+            if bottom < mid and x_lo <= cx <= x_hi:
+                blob = comp == i
+                if touch is None or (touch[y0:y1] & blob).any():
+                    out[y0:y1][blob] = True
+    return out
+
+
+def ink_mask(frame):
+    return frame.astype(np.int32).sum(-1) < BROW_INK
+
+
+def brow_zone(base, sheets, geo, moving):
+    """The base's own brow footprint, with a small margin: the static brow pixels belong to the brow part.
+
+    Only strokes that overlap `moving` (what the brow edits changed) count, so hair lines near the brows are not taken.
+
+    Clipped by the eye ink of the base and the eye frames, so the margin never eats the eye's own drawing (lash tips
+    of the open eye sit where the eye edits redraw a brow, see eye_frame_brows)."""
+    own = brow_strokes(base, geo, touch=moving)
+    eye_ink = np.zeros_like(own)
+    for f in [base] + list(sheets["eyes"][1:]):
+        eye_ink |= ink_mask(f) & ~ndimage.binary_dilation(brow_strokes(f, geo), iterations=1)
+    return ndimage.binary_dilation(own, iterations=BROW_ZONE_GROW) & ~ndimage.binary_dilation(eye_ink, iterations=2)
+
+
+def eye_frame_brows(frame, geo):
+    """The eyebrow strokes of ONE eye frame (plus margin), never touching that frame's own eye drawing.
+
+    The eye edits (lid25, lid50, lid75, narrow, shut on bluebob2) redraw the brows inside the eye band. The brows run as
+    their own track, so these strokes must not be part of an eye layer: a second brow would show next to the one the
+    brow track draws. They are painted over with skin, not made transparent: the base underneath still has the open
+    eye's lash tips exactly where a lowered brow is drawn in these frames."""
+    strokes = brow_strokes(frame, geo)
+    own_eye = ink_mask(frame) & ~ndimage.binary_dilation(strokes, iterations=1)
+    return ndimage.binary_dilation(strokes, iterations=BROW_ZONE_GROW) & ~ndimage.binary_dilation(own_eye, iterations=2)
+
+
+def skin_color(base, region):
+    """The flat skin colour inside a region of the base: the commonest colour that is not ink, white or blush."""
+    px = base[region].astype(np.int32)
+    keep = (px.sum(-1) >= BROW_INK) & (px.min(-1) <= WHITE) & ~((px[:, 0] > 190) & (px[:, 0] - px[:, 1] > 85))
+    px = px[keep]
+    if len(px) == 0:
+        return np.array([240, 190, 165], dtype=base.dtype)
+    q = (px // 8).astype(np.int64)
+    key = q[:, 0] * 1024 + q[:, 1] * 32 + q[:, 2]
+    top = np.bincount(key).argmax()
+    return np.median(px[key == top], axis=0).astype(base.dtype)
+
+
 def part_unions(base, sheets):
     W = base.shape[1]
     grow = max(1, int(GROW * W))
@@ -91,6 +170,13 @@ def part_unions(base, sheets):
     ex = np.nonzero(np.isin(lab, eyes_lab))[1]
     x = np.arange(base.shape[1])[None, :]
     raw["mouth"] &= (x >= ex.min()) & (x <= ex.max())
+    # The brow part owns the base's own brow footprint (see brow_zone); the strokes the eye edits redraw are
+    # painted out of the eye layers instead (see eye_frame_brows in build).
+    span = int(ex.max() - ex.min())
+    zone = brow_zone(base, sheets, (eye_top, eye_bot, ex.min() - 0.15 * span, ex.max() + 0.15 * span),
+                     ndimage.binary_dilation(raw["brows"], iterations=grow))
+    raw["eyes"] &= ~zone
+    raw["brows"] |= zone
     # Cheek blush: every edit redraws it slightly differently (bluebob2: blobs at the eye columns in 14 of 16
     # mouth frames), which bridged the mouth region out to both cheeks. It belongs to no part: find it in the
     # base by colour (much redder than skin: R-G > 85) and keep it out of every region.
@@ -113,7 +199,12 @@ def part_unions(base, sheets):
     dist = np.stack([np.where(grown[p], ndimage.distance_transform_edt(~raw[p]), np.inf) for p in names])
     owner = np.argmin(dist, axis=0)
     anyone = np.isfinite(dist.min(axis=0))
-    return {p: anyone & (owner == i) for i, p in enumerate(names)}, raw
+    regions = {p: anyone & (owner == i) for i, p in enumerate(names)}
+    # the base's brow footprint is the brows' by rule, whatever the distances said
+    regions["brows"] |= zone
+    regions["eyes"] &= ~zone
+    regions["mouth"] &= ~zone
+    return regions, raw, (eye_top, eye_bot, ex.min() - 0.15 * span, ex.max() + 0.15 * span)
 
 
 def soft(mask):
@@ -170,7 +261,7 @@ def pupils_of(img, region):
 def build(d):
     base, sheets = load_sheets(d)
     H, W = base.shape[:2]
-    regions, raw = part_unions(base, sheets)
+    regions, raw, geo = part_unions(base, sheets)
     out = os.path.join(d, "rig")
     os.makedirs(out, exist_ok=True)
     files = {"base.png": png(Image.fromarray(base.astype(np.uint8)))}
@@ -207,8 +298,11 @@ def build(d):
     base_pupils = pupils_of(base, regions["eyes"])
     pupil_info, clips = [], {}
     processed = []
+    skin = skin_color(base, regions["eyes"])
     for key, img in eye_frames:
         img = img.copy()
+        erase = eye_frame_brows(img, geo)   # the brows run as their own track: no brow stroke in an eye layer
+        img[erase] = skin
         found = pupils_of(img, regions["eyes"]) if base_pupils else None
         if found:
             clip = np.zeros(img.shape[:2], bool)

@@ -108,5 +108,83 @@ class RealSheets(unittest.TestCase):
         print(f"\npacked in {took:.1f} s, {len(result['png']) // 1024} KB")
 
 
+def brow_strokes_in_eye_layers(bundle):
+    """{frame: [(top, bottom, left, right, area), ...]} for every eyebrow stroke baked into an eye layer.
+
+    A brow stroke is an ink blob inside the eye columns that is separate from the eye (its own connected blob) and
+    whose bottom edge is above the eyes' midline, in full-frame coordinates: every real eye element (outline, lid line,
+    lashes, closed-eye curve) reaches below the midline. The face layout comes from the base image alone."""
+    import base64
+    import io
+
+    import numpy as np
+    from scipy import ndimage
+
+    def load(f):
+        return np.asarray(Image.open(io.BytesIO(base64.b64decode(bundle["files"][f]))).convert("RGBA"))
+
+    base = load(bundle["base"])[..., :3].astype(np.int32)
+    white = base.min(-1) > 225
+    lab, n = ndimage.label(white)
+    border = set(np.unique(np.concatenate([lab[0], lab[-1], lab[:, 0], lab[:, -1]])))
+    sizes = ndimage.sum(white, lab, range(1, n + 1))
+    eyes_lab = [i for i in (1 + np.argsort(sizes)[::-1]) if i not in border][:2]
+    ys, xs = np.nonzero(np.isin(lab, eyes_lab))
+    eye_top, eye_bot = int(ys.min()), int(ys.max())
+    mid = eye_top + 0.5 * (eye_bot - eye_top)
+    span = xs.max() - xs.min()
+    x_lo, x_hi = xs.min() - 0.15 * span, xs.max() + 0.15 * span
+
+    eyes = bundle["parts"]["eyes"]
+    x0, y0, _, _ = eyes["box"]
+    found = {}
+    for key, f in eyes["frames"].items():
+        px = load(f)
+        ink = (px[..., :3].astype(np.int32).sum(-1) < 200) & (px[..., 3] > 128)
+        comp, k = ndimage.label(ink, structure=np.ones((3, 3)))
+        for i in range(1, k + 1):
+            yy, xx = np.nonzero(comp == i)
+            if len(yy) < 100:
+                continue
+            top, bottom, left, right = y0 + yy.min(), y0 + yy.max(), x0 + xx.min(), x0 + xx.max()
+            if bottom < mid and x_lo <= (left + right) / 2 <= x_hi:
+                found.setdefault(key, []).append((int(top), int(bottom), int(left), int(right), len(yy)))
+    return found
+
+
+@unittest.skipUnless(
+    all(os.path.isfile(os.path.join(SAMPLES, f)) for f in ("parts-mouth.png", "parts-idle.png", "parts-eyes.png", "parts-brows.png")),
+    "Rig Studio sample sheets not found (set RIG_SAMPLES)",
+)
+class EyeLayersHaveNoBrows(unittest.TestCase):
+    """The brows run as their own track, so no eye layer may carry a brow stroke (it would show as a second brow).
+
+    Found 2026-10-21 on bluebob2: the lid25, lid50, lid75, narrow and shut eye frames each carried one, because the
+    eye edits redraw the brows inside the eye band and the packer cut that band out as part of the eye layer."""
+
+    @classmethod
+    def setUpClass(cls):
+        import m3ds
+
+        paths = {p: os.path.join(SAMPLES, f"parts-{p}.png") for p in J.PARTS}
+        result = J.pack(paths, "bluebob2", log=lambda m: None)
+        cls.bundle = json.loads(m3ds.decode_png_bytes(result["png"])[0])
+
+    def test_no_eye_layer_carries_a_brow_stroke(self):
+        self.assertEqual(brow_strokes_in_eye_layers(self.bundle), {})
+
+    def test_the_eye_itself_is_still_there(self):
+        # not over-cleaned: every frame keeps its eye structure (lashes, lid line, closed curve) below the midline
+        import base64
+        import io
+
+        import numpy as np
+
+        for key, f in self.bundle["parts"]["eyes"]["frames"].items():
+            px = np.asarray(Image.open(io.BytesIO(base64.b64decode(self.bundle["files"][f]))).convert("RGBA"))
+            ink = ((px[..., :3].astype(int).sum(-1) < 200) & (px[..., 3] > 128)).sum()
+            self.assertGreater(ink, 800, f"eye frame {key} lost its drawing ({ink} ink pixels)")
+
+
 if __name__ == "__main__":
     unittest.main()

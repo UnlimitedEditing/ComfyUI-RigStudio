@@ -63,26 +63,46 @@ def keep_largest(mask, n):
 BROW_INK = 200       # summed RGB below this = outline ink
 BROW_BLOB = 100      # px: smaller ink blobs are specks, not strokes
 BROW_ZONE_GROW = 4   # px of margin around a brow stroke (covers its antialiased edge)
+BROW_THICK = 0.12    # radius of a brow stroke, as a fraction of the eye height (lid lines and lashes are thinner)
 
 
-def brow_strokes(frame, geo, touch=None):
+def thick_cores(ink, radius):
+    """-> (label image, count) of the parts of `ink` that are strokes at least 2*radius thick (brows are; lid lines,
+    lashes and hair lines are not): the ink opened with a disk of that radius."""
+    r = max(2, radius)
+    yy, xx = np.mgrid[-r:r + 1, -r:r + 1]
+    core = ndimage.binary_opening(ink, structure=(xx * xx + yy * yy) <= r * r)
+    return ndimage.label(core, structure=np.ones((3, 3)))
+
+
+def brow_strokes(frame, geo):
     """Mask of the eyebrow strokes in a full frame.
 
-    A brow stroke is an ink blob that is SEPARATE from the eye (its own connected blob), sits inside the eye columns,
-    and whose bottom edge is above the eyes' midline. Every real eye element (outline, lid line, lashes, the closed-eye
-    curve) reaches below the midline, so the test does not need to know where the brows "should" be: the eye edits
-    (lid25..narrow, shut) redraw the brows lower, at rest or tilted, and "above the top of the eye whites" would miss
-    those (bluebob2: the tilted brows of lid75/narrow sit lower than the whites' top).
+    A brow stroke is an ink blob that (1) overlaps what the BROW EDITS redraw (`moving`: the changed pixels of every
+    brows-sheet frame, grown a little), (2) is SEPARATE from the eye (its own connected blob), (3) sits inside the eye
+    columns, and (4) has its bottom edge above the eyes' midline (every real eye element reaches below it).
 
-    `touch`, when given, keeps only the strokes that overlap that mask (used to leave hair lines alone: they sit in the
-    same columns but never move with the brows)."""
-    top, bot, x_lo, x_hi = geo
+    (1) is the one that tells a brow from the eye's own drawing. Position cannot: the eye edits (lid25..narrow, shut)
+    redraw the brows low, right where another character's upper-lid arc sits (a freckled boy, 2026-10-21: a thin arc
+    above each open eye is part of the eye, and a lowered brow in `narrow` covers the same rows). Lid arcs and hair lines
+    never change when only the brows are edited; brows always do."""
+    top, bot, x_lo, x_hi, moving = geo
     mid = top + 0.5 * (bot - top)
     y0 = max(0, top - (bot - top))                # brows can sit well above the whites
     y1 = min(frame.shape[0], bot + int(0.1 * (bot - top)))
     ink = frame[y0:y1].astype(np.int32).sum(-1) < BROW_INK
     comp, n = ndimage.label(ink, structure=np.ones((3, 3)))
     out = np.zeros(frame.shape[:2], bool)
+    # Thick strokes are brows even where they touch the eye's ink (a lowered brow bridged to the lid line by one
+    # anti-aliased pixel makes ONE blob, which the blob rule below cannot see): found by opening, then regrown.
+    r = max(2, int(BROW_THICK * (bot - top)))
+    cores, cn = thick_cores(ink, r)
+    for i, (ys, xs) in enumerate(ndimage.find_objects(cores), start=1):
+        bottom, cx = y0 + ys.stop - 1, (xs.start + xs.stop - 1) / 2
+        # tested on the core (regrowing bleeds into the lid line); a little slack, a brow tilted down toward the nose
+        # reaches past the midline in `narrow`, while a pupil's core ends far below it
+        if bottom < mid + 0.1 * (bot - top) and x_lo <= cx <= x_hi:
+            out[y0:y1] |= ndimage.binary_dilation(cores == i, iterations=r + 2, mask=ink)
     if n:
         areas = ndimage.sum(ink, comp, range(1, n + 1))
         for i, (ys, xs) in enumerate(ndimage.find_objects(comp), start=1):
@@ -91,7 +111,7 @@ def brow_strokes(frame, geo, touch=None):
             bottom, cx = y0 + ys.stop - 1, (xs.start + xs.stop - 1) / 2
             if bottom < mid and x_lo <= cx <= x_hi:
                 blob = comp == i
-                if touch is None or (touch[y0:y1] & blob).any():
+                if (moving[y0:y1] & blob).any():
                     out[y0:y1][blob] = True
     return out
 
@@ -100,14 +120,14 @@ def ink_mask(frame):
     return frame.astype(np.int32).sum(-1) < BROW_INK
 
 
-def brow_zone(base, sheets, geo, moving):
+def brow_zone(base, sheets, geo):
     """The base's own brow footprint, with a small margin: the static brow pixels belong to the brow part.
 
-    Only strokes that overlap `moving` (what the brow edits changed) count, so hair lines near the brows are not taken.
+    Only strokes the brow edits redraw count (see brow_strokes), so hair lines near the brows are not taken.
 
     Clipped by the eye ink of the base and the eye frames, so the margin never eats the eye's own drawing (lash tips
     of the open eye sit where the eye edits redraw a brow, see eye_frame_brows)."""
-    own = brow_strokes(base, geo, touch=moving)
+    own = brow_strokes(base, geo)
     eye_ink = np.zeros_like(own)
     for f in [base] + list(sheets["eyes"][1:]):
         eye_ink |= ink_mask(f) & ~ndimage.binary_dilation(brow_strokes(f, geo), iterations=1)
@@ -147,6 +167,7 @@ def part_unions(base, sheets):
         "eyes": np.logical_or.reduce([changed_mask(f, base) for f in sheets["eyes"][1:]]),
         "brows": np.logical_or.reduce([changed_mask(f, base) for f in sheets["brows"][1:]]),
     }
+    moving_brows = raw["brows"].copy()   # before the layout bounds below: a lowered brow reaches past the brow line
     # An edit sometimes spills into a neighbour (live, bluebob2: "narrow"/"shut" eyes also tilted the brows, the
     # strong brow frown also turned the mouth down). Bound each part by the face's own layout, taken from the
     # base: the eye whites (big near-white blobs not touching the border) give the eye band; brows live above
@@ -173,8 +194,9 @@ def part_unions(base, sheets):
     # The brow part owns the base's own brow footprint (see brow_zone); the strokes the eye edits redraw are
     # painted out of the eye layers instead (see eye_frame_brows in build).
     span = int(ex.max() - ex.min())
-    zone = brow_zone(base, sheets, (eye_top, eye_bot, ex.min() - 0.15 * span, ex.max() + 0.15 * span),
-                     ndimage.binary_dilation(raw["brows"], iterations=grow))
+    geo = (eye_top, eye_bot, ex.min() - 0.15 * span, ex.max() + 0.15 * span,
+           ndimage.binary_dilation(moving_brows, iterations=grow))
+    zone = brow_zone(base, sheets, geo)
     raw["eyes"] &= ~zone
     raw["brows"] |= zone
     # Cheek blush: every edit redraws it slightly differently (bluebob2: blobs at the eye columns in 14 of 16
@@ -204,7 +226,7 @@ def part_unions(base, sheets):
     regions["brows"] |= zone
     regions["eyes"] &= ~zone
     regions["mouth"] &= ~zone
-    return regions, raw, (eye_top, eye_bot, ex.min() - 0.15 * span, ex.max() + 0.15 * span)
+    return regions, raw, geo
 
 
 def soft(mask):

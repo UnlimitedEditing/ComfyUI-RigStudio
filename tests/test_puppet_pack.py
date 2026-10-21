@@ -5,6 +5,7 @@
 The end-to-end test needs the four sheets and the finished puppet from Rig Studio's samples
 (RIG_SAMPLES, default D:/rig-studio/samples/puppet/bluebob2) and is skipped without them.
 """
+import glob
 import json
 import os
 import sys
@@ -184,6 +185,48 @@ class EyeLayersHaveNoBrows(unittest.TestCase):
             px = np.asarray(Image.open(io.BytesIO(base64.b64decode(self.bundle["files"][f]))).convert("RGBA"))
             ink = ((px[..., :3].astype(int).sum(-1) < 200) & (px[..., 3] > 128)).sum()
             self.assertGreater(ink, 800, f"eye frame {key} lost its drawing ({ink} ink pixels)")
+
+NEWCHAR = os.environ.get("RIG_NEWCHAR", "D:/tripostl/test_out/rig-newchar")
+
+
+@unittest.skipUnless(
+    all(glob.glob(os.path.join(NEWCHAR, p, "*.png")) for p in J.PARTS),
+    "new-character sheets not found (set RIG_NEWCHAR)",
+)
+class EyeLayersHaveNoBrowsNewCharacter(unittest.TestCase):
+    """The same rule on a second character (freckled boy, 2026-10-21), whose eye drawing differs from bluebob2:
+    a thin arc above each open eye is part of the eye, and the lowered brow in `narrow` tilts past the eye midline.
+    The first brow rule erased the arcs and missed that brow; this one has to do neither."""
+
+    @classmethod
+    def setUpClass(cls):
+        import m3ds
+
+        paths = {p: glob.glob(os.path.join(NEWCHAR, p, "*.png"))[0] for p in J.PARTS}
+        result = J.pack(paths, "newchar", log=lambda m: None)
+        cls.bundle = json.loads(m3ds.decode_png_bytes(result["png"])[0])
+
+    def test_no_brow_stroke_is_left_in_an_eye_layer(self):
+        # `wide`'s outline arc is cut by the layer's top edge into two small blobs, which are not brows
+        found = brow_strokes_in_eye_layers(self.bundle)
+        big = {k: [c for c in v if c[4] >= 400] for k, v in found.items()}
+        self.assertEqual({k: v for k, v in big.items() if v}, {})
+
+    def test_the_lowered_brow_in_narrow_is_gone_and_its_lid_line_stays(self):
+        import base64
+        import io
+
+        import numpy as np
+        from scipy import ndimage
+
+        f = self.bundle["parts"]["eyes"]["frames"]["narrow"]
+        px = np.asarray(Image.open(io.BytesIO(base64.b64decode(self.bundle["files"][f]))).convert("RGBA"))
+        ink = (px[..., :3].astype(int).sum(-1) < 200) & (px[..., 3] > 128)
+        lab, n = ndimage.label(ink, structure=np.ones((3, 3)))
+        thick = [i for i in range(1, n + 1) if ndimage.distance_transform_edt(lab == i).max() >= 14]
+        # only the pupils (round, 2) are that thick: a brow stroke would make it 3 or 4
+        self.assertLessEqual(len(thick), 2)
+        self.assertGreaterEqual(ink.sum(), 2 * 1500)
 
 
 if __name__ == "__main__":

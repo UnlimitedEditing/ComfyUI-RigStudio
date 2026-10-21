@@ -223,7 +223,7 @@ def eye_region(base, frames, geo, band):
         img = Image.new("L", (W, H), 0)
         ImageDraw.Draw(img).polygon([(int(x), int(y)) for y, x in hull], fill=255)
         region |= np.asarray(img) > 0
-    return ndimage.binary_dilation(region, iterations=margin) & in_band, sclera
+    return ndimage.binary_dilation(region, iterations=margin) & in_band, sclera, ndimage.binary_fill_holes(w0)
 
 
 def despeckle_skin(img, region):
@@ -241,7 +241,7 @@ def despeckle_skin(img, region):
     return out
 
 
-def lidded_pupils(img, sclera, base_pupils, eh):
+def lidded_pupils(img, sclera, open_white, base_pupils, eh):
     """For an eye frame whose lid cuts the whites (so pupils_of fails): -> (pupil mask, clip) or None.
 
     The pupils of such a frame are drawn by the model at their own size and place, which flickered against the open
@@ -261,7 +261,43 @@ def lidded_pupils(img, sclera, base_pupils, eh):
     near = ndimage.binary_dilation(sclera, iterations=4)   # not the white background around the head
     white = (img.min(-1) > WHITE) & near
     opening = ndimage.binary_fill_holes(ndimage.binary_closing(white | pupil, iterations=2)) & near
-    return pupil, opening
+    lab, n = ndimage.label(opening)
+    ids = np.unique(lab[pupil & opening])
+    opening = np.isin(lab, ids[ids > 0])   # the opening the pupils sit in, not the crease lines
+    if not opening.any():
+        return None
+    return pupil, normalised_opening(opening, open_white), opening
+
+
+def normalised_opening(opening, open_white):
+    """The part of the OPEN eye's white that the lid leaves visible, in place of the frame's own white.
+
+    The model redraws the whites a little smaller or shifted in every lidded frame (inner corner 11 px short on the
+    freckled boy), which flickers against the open eye. So the whites of a lidded frame are taken from the base eye:
+    each column of the base white is visible from the frame's lid line down (the lid line height of columns the frame's
+    own white does not reach is carried over from the nearest column that has one)."""
+    H, W = opening.shape
+    out = np.zeros_like(opening)
+    cx = np.nonzero(open_white)[1].mean()
+    rows = np.arange(H)[:, None]
+    for side in (np.arange(W) < cx, np.arange(W) >= cx):
+        cols = np.nonzero(open_white.any(0) & side)[0]
+        if not len(cols):
+            continue
+        top = np.full(W, np.nan)
+        for c in cols:
+            r = np.nonzero(opening[:, c])[0]
+            if len(r):
+                top[c] = r.min()
+        ok = cols[~np.isnan(top[cols])]
+        if not len(ok):
+            return opening
+        for c in cols:
+            if np.isnan(top[c]):
+                top[c] = top[ok[np.argmin(np.abs(ok - c))]]
+        t = np.where(np.isnan(top), 0, top)[None, :]
+        out |= open_white & side[None, :] & (rows >= t)
+    return out
 
 
 def part_unions(base, sheets):
@@ -330,11 +366,11 @@ def part_unions(base, sheets):
     # the base's brow footprint is the brows' by rule, whatever the distances said
     regions["brows"] |= zone
     regions["mouth"] &= ~zone
-    regions["eyes"], sclera = eye_region(base, sheets["eyes"][1:], geo, (eye_top - int(0.25 * eh), mouth_line))
+    regions["eyes"], sclera, open_white = eye_region(base, sheets["eyes"][1:], geo, (eye_top - int(0.25 * eh), mouth_line))
     regions["eyes"] &= ~(ndimage.binary_dilation(blush, iterations=8) & ~ndimage.binary_dilation(sclera, iterations=2))   # cheek blush belongs to no part
     regions["eyes"] &= ~(zone & ~ndimage.binary_dilation(sclera, iterations=2))   # the brows' footprint stays theirs
     regions["mouth"] &= ~regions["eyes"]
-    return regions, raw, geo + (sclera,)
+    return regions, raw, geo + (sclera, open_white)
 
 
 def soft(mask):
@@ -457,11 +493,16 @@ def build(d):
                 clip |= filled
             clips[key] = clip
         elif base_pupils and key != "open":
-            lp = lidded_pupils(img, geo[5], base_pupils, geo[1] - geo[0])
+            lp = lidded_pupils(img, geo[5], geo[6], base_pupils, geo[1] - geo[0])
             if lp:
-                pupil, opening = lp
-                img[pupil] = np.median(img[(img.min(-1) > WHITE) & geo[5]], axis=0)
-                clips[key] = opening
+                pupil, shown, own = lp
+                white_col = np.median(img[(img.min(-1) > WHITE) & geo[5]], axis=0)
+                lid_ink = ink_mask(img) & ~pupil
+                img[(own & ~shown) & ~lid_ink] = skin       # the frame's own white where the open eye has none
+                img[shown & ~lid_ink] = white_col           # the open eye's white: same shape in every frame, no fringe
+                clips[key] = shown
+                crease = (img.min(-1) > WHITE) & ~ndimage.binary_dilation(shown, iterations=3) & regions["eyes"]
+                img[crease] = skin                          # pale crease lines above the lid are not eye white
         processed.append((key, img))
     e, alpha, box = add_part("eyes", regions["eyes"], processed)
     e["rest"] = "open"
